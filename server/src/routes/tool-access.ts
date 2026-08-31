@@ -1,4 +1,4 @@
-import { Router, type Request } from "express";
+import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { agents, companies, connectionGrants, issueThreadInteractions, toolConnectionInstalls } from "@paperclipai/db";
 import { and, eq, or } from "drizzle-orm";
@@ -898,7 +898,7 @@ export function toolAccessRoutes(
     res.redirect(303, "/apps/connections?cloud_connector=enrolled");
   });
 
-  router.get(["/tools/oauth/cloud-connector/callback", "/tools/oauth/paperclip-id/callback"], async (req, res) => {
+  const handlePaperclipCloudConnectorCallback = async (req: Request, res: Response) => {
     assertBoard(req);
     const state = typeof req.query.state === "string" ? req.query.state : "";
     const claimId = typeof req.query.claim_id === "string" ? req.query.claim_id : null;
@@ -983,7 +983,9 @@ export function toolAccessRoutes(
         typeof details?.code === "string" ? details.code : null,
       ));
     }
-  });
+  };
+  router.get("/tools/oauth/cloud-connector/callback", handlePaperclipCloudConnectorCallback);
+  router.get("/tools/oauth/paperclip-id/callback", handlePaperclipCloudConnectorCallback);
 
   router.get("/tools/vercel-connect/callback", async (req, res) => {
     assertBoard(req);
