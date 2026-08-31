@@ -78,7 +78,10 @@ changing the underlying Google principal.
 
 The Paperclip-managed method signs every broker request with one explicit
 profile. The broker binds that profile into sessions, one-time claims, sealed
-token envelopes, refresh, and revocation.
+token envelopes, and refresh. Per-profile removal is local-only for managed
+Google grants. Google's revocation endpoint can invalidate all grants for the
+same user and managed client, so Paperclip does not call it while removing one
+Workspace profile.
 
 | App | Read profile | Write profile |
 | --- | --- | --- |

@@ -264,9 +264,10 @@ Only the opaque claim id and the instance's local state cross the browser back
 to the instance. Provider codes, tokens, error descriptions, client secrets,
 emails, and tenant identifiers do not appear in URLs. Cloud consumes provider
 state before examining any code or provider error; unknown and replayed state
-never redirects. Initial ciphertext expires within five minutes and is deleted
-on claim. Plaintext provider tokens exist in Cloud memory only for the bounded
-exchange, refresh, or revocation request.
+never redirects. Initial ciphertext expires within five minutes. The first
+claim binds it to a stable local redemption id, and only that id can retry the
+same sealed envelope before expiry. Plaintext provider tokens exist in Cloud
+memory only for the bounded exchange, refresh, or supported revocation request.
 
 ```mermaid
 sequenceDiagram
@@ -279,13 +280,17 @@ sequenceDiagram
     O-->>C: Rotated credentials
     C-->>P: New credentials sealed to the instance key
     P->>P: Validate bindings and rotate vault secrets
-    P->>C: Signed revocation with hash-bound token
-    C->>O: Revoke provider grant
-    C-->>P: Detail-free result
+    opt Provider proves isolated per-grant revocation
+        P->>C: Signed revocation with hash-bound token
+        C->>O: Revoke provider grant
+        C-->>P: Detail-free result
+    end
 ```
 
-Managed grants therefore depend on Cloud for refresh and revocation, but not
-for provider tool calls. A temporary Cloud outage leaves an existing access
+Managed grants therefore depend on Cloud for refresh and supported provider
+revocation, but not for provider tool calls. Managed Google profile removal is
+local-only because Google client-wide revocation can invalidate the same user's
+other Workspace profiles. A temporary Cloud outage leaves an existing access
 token usable until it expires and then surfaces as a temporary refresh failure.
 Customer-created clients remain available for self-hosters who need full
 independence or for providers not approved for a managed multi-tenant client.

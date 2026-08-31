@@ -4827,8 +4827,9 @@ describeEmbeddedPostgres("tool access service", () => {
     const userId = `gmail-member-${randomUUID()}`;
     await grantBoardUser(db, company.id, userId, []);
     const callbackDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
+    const connector = fakeGmailConnector(company.id, userId);
     const service = createTestToolAccessService(callbackDb, {
-      paperclipCloudConnector: fakeGmailConnector(company.id, userId),
+      paperclipCloudConnector: connector,
     });
     const actor = { actorType: "user" as const, actorId: userId };
     const gmailDefinition = getConnectableAppDefinition("gmail")!;
@@ -4872,12 +4873,66 @@ describeEmbeddedPostgres("tool access service", () => {
         "oauth.access_token",
         "oauth.refresh_token",
       ]);
+      await expect(service.revokeConnectionGrant(connected.connectionId, grant!.id, actor))
+        .resolves.toMatchObject({ status: "revoked" });
+      expect(connector.revoke).not.toHaveBeenCalled();
     } finally {
       gmailDefinition.ownershipAvailability = previousOwnershipAvailability;
       if (deadline) clearTimeout(deadline);
       await callbackDb.$client.end({ timeout: 0 }).catch(() => undefined);
     }
   }, 15_000);
+
+  it("keeps brokered OAuth state retryable until credentials are durably stored", async () => {
+    const company = await createCompany(db);
+    const userId = `gmail-retry-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, []);
+    const connector = fakeGmailConnector(company.id, userId);
+    vi.mocked(connector.claim)
+      .mockRejectedValueOnce(new Error("temporary claim failure"));
+    const service = createTestToolAccessService(db, { paperclipCloudConnector: connector });
+    const actor = { actorType: "user" as const, actorId: userId };
+    const gmailDefinition = getConnectableAppDefinition("gmail")!;
+    const previousOwnershipAvailability = gmailDefinition.ownershipAvailability;
+    gmailDefinition.ownershipAvailability = { ...previousOwnershipAvailability, platform_shared: true };
+    mockToolsList([]);
+
+    try {
+      const connected = await service.connectGalleryApp(company.id, {
+        galleryKey: "gmail",
+        connectionMethodKey: "paperclip-draft",
+        grantKind: "user",
+        name: "Gmail retryable callback",
+      }, actor);
+      const started = await service.startOAuth(company.id, connected.connectionId, {
+        redirectUri: "https://paperclip.example/api/tools/oauth/cloud-connector/callback",
+        actor,
+      });
+      const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+
+      await expect(service.completePaperclipCloudConnectorCallback({
+        state,
+        claimId: "gmail-retry-claim",
+        actor,
+      })).rejects.toThrow("temporary claim failure");
+      await expect(service.peekOAuthState(state)).resolves.toMatchObject({
+        companyId: company.id,
+        connectionId: connected.connectionId,
+        subjectUserId: userId,
+      });
+
+      await expect(service.completePaperclipCloudConnectorCallback({
+        state,
+        claimId: "gmail-retry-claim",
+        actor,
+      })).resolves.toMatchObject({ connection: { status: "active", enabled: true } });
+      await expect(service.peekOAuthState(state)).resolves.toBeNull();
+      expect(connector.claim).toHaveBeenNthCalledWith(1, expect.objectContaining({ redemptionId: state }));
+      expect(connector.claim).toHaveBeenNthCalledWith(2, expect.objectContaining({ redemptionId: state }));
+    } finally {
+      gmailDefinition.ownershipAvailability = previousOwnershipAvailability;
+    }
+  });
 
   it("serializes brokered Gmail OAuth completion behind membership revocation", async () => {
     const company = await createCompany(db);

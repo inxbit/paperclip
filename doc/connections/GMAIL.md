@@ -89,8 +89,8 @@ Open **Google Auth Platform → Branding**. Set:
 The homepage, privacy policy, and terms must be live on the verified domain
 before production verification. The privacy policy must explain that the
 originating Paperclip instance stores Gmail credentials and that Paperclip Cloud
-performs bounded OAuth exchange, refresh, and revocation without durable
-plaintext token storage.
+performs bounded OAuth exchange, refresh, and provider-supported revocation
+without durable plaintext token storage.
 
 ### 4. Configure the audience
 
@@ -232,13 +232,22 @@ Before an instance can create a session:
    deployment environment, and exact allowed browser return origins.
 4. Tailscale HTTPS origins are allowed only when explicitly enrolled. Loopback
    HTTP is development-only. Other plaintext origins are rejected.
-5. Create, claim, refresh, and revoke requests are signed, audience-bound,
+5. Create, claim, refresh, and supported revoke requests are signed, audience-bound,
    timestamped, and protected by a one-time `jti` replay cache.
 
 Paperclip Cloud may retain instance-encrypted initial-token ciphertext for at most
-five minutes. It deletes the ciphertext on claim or expiry and excludes it from
-long-term backups. Refresh and revoke handle plaintext only in memory for one
-bounded request.
+five minutes. It binds the first claim to a stable local redemption id and only
+returns the same ciphertext to that redemption id during the retry window. It
+deletes the ciphertext on expiry and excludes it from long-term backups. Refresh
+and supported revoke operations handle plaintext only in memory for one bounded
+request.
+
+Removing one managed Google profile revokes only the local Paperclip grant.
+Paperclip does not call Google's token revocation endpoint for that action.
+Google treats revocation as client-wide for the user, so a provider-side revoke
+could also invalidate the user's other managed Gmail, Drive, and Calendar
+profiles. A future provider-level disconnect must present that all-profiles
+effect explicitly.
 
 ### Configure each originating Paperclip instance
 

@@ -9944,23 +9944,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return row ?? null;
   }
 
-  /**
-   * Answer a pending authorization request exactly once (PAP-17109).
-   *
-   * Every terminal callback — success, denial, cancel — comes through here, so
-   * the row that authorizes a token exchange stops existing the moment the flow
-   * reaches an outcome. Two properties matter and they pull in opposite
-   * directions:
-   *
-   * - A stranger's callback must not *consume* the request. So the row is loaded
-   *   and bound to the caller before anything is deleted; a failed binding check
-   *   leaves the victim's flow live and completable.
-   * - A replayed callback must not *complete* the request. So the delete is the
-   *   single statement that decides ownership: `RETURNING` hands the row to
-   *   exactly one of two concurrent callbacks, and the loser is told the state is
-   *   spent instead of exchanging a code against it.
-   */
-  async function consumeOAuthState(state: string, actor: ActorInfo | undefined) {
+  /** Bind a callback to its initiating actor without consuming retryable state. */
+  async function validateOAuthState(state: string, actor: ActorInfo | undefined) {
     const [stateRow] = await db
       .select()
       .from(toolOauthStates)
@@ -9975,6 +9960,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     } else {
       assertSameOAuthActor(stateRow, actor);
     }
+    return stateRow;
+  }
+
+  /**
+   * Answer a terminal authorization callback exactly once. Actor validation
+   * happens before the atomic delete, so an unbound callback cannot consume a
+   * valid flow and concurrent callbacks cannot both complete it.
+   */
+  async function consumeOAuthState(state: string, actor: ActorInfo | undefined) {
+    const stateRow = await validateOAuthState(state, actor);
     const [consumed] = await db
       .delete(toolOauthStates)
       .where(eq(toolOauthStates.state, state))
@@ -10092,14 +10087,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     error?: string | null;
     actor?: ActorInfo;
   }): Promise<ConnectToolAppResult> {
-    const stateRow = await consumeOAuthState(input.state, input.actor);
+    // Keep the local state live until the sealed claim is in the durable vault.
+    // The broker binds repeat claim requests to this stable state value, so a
+    // transient broker, database, or secret-store failure can retry safely.
+    const stateRow = await validateOAuthState(input.state, input.actor);
     let connection = await getConnectionRow(stateRow.connectionId, stateRow.companyId);
     const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string" ? connection.config.sourceTemplateKey : null;
     const galleryEntry = sourceTemplateKey ? getConnectableAppDefinition(sourceTemplateKey) : null;
     const method = galleryEntry ? connectionMethodForConnection(galleryEntry, connection) : null;
     const providerName = galleryEntry?.name ?? "Google Workspace";
     if (input.error) {
-      await rejectPendingOAuthInteraction(stateRow, input.actor);
+      const consumedState = await consumeOAuthState(input.state, input.actor);
+      await rejectPendingOAuthInteraction(consumedState, input.actor);
       throw new HttpError(400, `Google authorization did not complete. Start a new ${providerName} connection to try again.`, {
         code: input.error === "access_denied" ? "oauth_authorization_denied" : "paperclip_cloud_connector_failed",
       });
@@ -10123,6 +10122,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       companyId: stateRow.companyId,
       profile: connectorProfile,
       claimId: input.claimId,
+      redemptionId: input.state,
     });
     const refreshToken = credentials.refreshToken;
     if (!refreshToken) {
@@ -10145,6 +10145,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       if (!membership) {
         throw forbidden(`Your company membership no longer permits connection changes. Restore non-viewer access before you connect ${providerName} again.`);
       }
+      const [consumedState] = await tx
+        .delete(toolOauthStates)
+        .where(and(
+          eq(toolOauthStates.state, input.state),
+          gte(toolOauthStates.expiresAt, new Date()),
+        ))
+        .returning({ state: toolOauthStates.state });
+      if (!consumedState) throw badRequest("OAuth state was not found, expired, or has already been used");
       const txSecrets = secretService(tx);
       const txSecretContext = { dbClient: tx, secretClient: txSecrets };
       const [existingUserGrant] = await tx.select().from(connectionGrants).where(and(
@@ -11938,43 +11946,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             providerRevocation = "failed";
           }
         }
-      } else if (isPaperclipCloudConnectorStrategy(oauthConfig(connection).strategy) && currentCloudConnector()) {
-        const cloudConnector = currentCloudConnector()!;
-        const connectorOauth = oauthConfig(connection);
-        const connectorSubject = currentGrant.subjectUserId ?? readConfigString(connectorOauth, "connectorSubjectUserId");
-        const connectorProfile = readConfigString(connectorOauth, "connectorProfile");
-        const tokenRef = currentGrant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token")
-          ?? currentGrant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
-        if (tokenRef) {
-          try {
-            const token = await secrets.resolveSecretValue(
-              connection.companyId,
-              tokenRef.secretId,
-              tokenRef.versionSelector ?? "latest",
-              {
-                consumerType: "tool_connection",
-                consumerId: connection.id,
-                configPath: tokenRef.configPath,
-                actorType: binding.actorType ?? "system",
-                actorId: binding.actorId,
-              },
-            );
-            if (!connectorSubject || !connectorProfile || !isGoogleWorkspaceConnectorProfileId(connectorProfile)) {
-              throw new Error("Google connector binding is incomplete");
-            }
-            await cloudConnector.revoke({
-              subject: connectorSubject,
-              companyId: connection.companyId,
-              profile: connectorProfile,
-              token,
-            });
-            providerRevocation = "success";
-          } catch {
-            // Local revocation is authoritative for Paperclip and must not be
-            // rolled back because Google or the broker is temporarily offline.
-            providerRevocation = "failed";
-          }
-        }
+      } else if (isPaperclipCloudConnectorStrategy(oauthConfig(connection).strategy)) {
+        // Google revocation is client-wide for a user. The managed Workspace
+        // profiles intentionally share one Paperclip-owned client, so revoking
+        // one token here could invalidate unrelated Gmail, Drive, and Calendar
+        // grants. A per-profile removal is therefore local-only. A future
+        // provider-level disconnect must warn that it removes every profile.
+        providerRevocation = "local_only_shared_client";
       }
       const grant = await db.transaction(async (tx) => {
         const removedDelegations = await tx.delete(connectionGrantDelegations).where(and(

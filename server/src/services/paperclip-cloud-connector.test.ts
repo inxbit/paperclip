@@ -105,7 +105,12 @@ describe("Paperclip Cloud connector", () => {
     }));
     const connector = createPaperclipCloudConnector({ config: keys.config, request: request as typeof fetch });
 
-    await expect(connector.claim({ subject, companyId, claimId: "clm_test" })).resolves.toEqual(credentials);
+    await expect(connector.claim({
+      subject,
+      companyId,
+      claimId: "clm_test",
+      redemptionId: "local-oauth-state-1",
+    })).resolves.toEqual(credentials);
   });
 
   it("binds non-Gmail credentials and requests to their exact connector profile", async () => {
@@ -131,11 +136,18 @@ describe("Paperclip Cloud connector", () => {
       const [, encodedClaims] = body.request.split(".");
       const claims = JSON.parse(Buffer.from(encodedClaims!, "base64url").toString("utf8"));
       expect(claims.prf).toBe(profile);
+      expect(claims.rid).toBe("local-oauth-state-drive");
       return Response.json({ claimId: "clm_drive", scopes: credentials.scopes, sealed });
     });
     const connector = createPaperclipCloudConnector({ config: keys.config, request: request as typeof fetch });
 
-    await expect(connector.claim({ subject, companyId, profile, claimId: "clm_drive" })).resolves.toEqual(credentials);
+    await expect(connector.claim({
+      subject,
+      companyId,
+      profile,
+      claimId: "clm_drive",
+      redemptionId: "local-oauth-state-drive",
+    })).resolves.toEqual(credentials);
   });
 
   it("accepts only the current capability protocol and known profiles", async () => {
