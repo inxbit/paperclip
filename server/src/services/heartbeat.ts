@@ -90,6 +90,7 @@ import {
 // git-credentials module became its canonical home; existing importers keep working.
 export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
+import { materializeLegacyQuestionResponseWakeProjection } from "./native-runtime/native-interaction-bridge.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
@@ -5594,7 +5595,7 @@ export function shouldAutoCheckoutIssueForWake(input: {
   return true;
 }
 
-function shouldQueueFollowupForRunningIssueWake(input: {
+export function shouldQueueFollowupForRunningIssueWake(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   wakeCommentId: string | null;
 }) {
@@ -11026,14 +11027,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       try {
         if (running) {
           await terminateHeartbeatRunProcess({
-            pid: running.child.pid ?? run.processPid,
-            processGroupId: running.processGroupId ?? run.processGroupId,
+            pid: running.child.pid,
+            processGroupId: running.processGroupId,
             graceMs: Math.max(1, running.graceSec) * 1000,
-          });
-        } else if (run.processPid || run.processGroupId) {
-          await terminateHeartbeatRunProcess({
-            pid: run.processPid,
-            processGroupId: run.processGroupId,
           });
         }
       } finally {
@@ -16709,7 +16705,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (!guardedDispatch.dispatched) return;
           adapterResult = await guardedDispatch.resultPromise;
         } else {
-          const adapterContext = { ...context };
+          const interactionId = readNonEmptyString(context.interactionId);
+          const legacyQuestionResponse =
+            issueRef
+            && interactionId
+            && readNonEmptyString(context.interactionKind) === "ask_user_questions"
+            && readNonEmptyString(context.interactionStatus) === "answered"
+              ? await materializeLegacyQuestionResponseWakeProjection({
+                  db,
+                  companyId: agent.companyId,
+                  issueId: issueRef.id,
+                  runId: run.id,
+                  agentId: agent.id,
+                  interactionId,
+                })
+              : null;
+          // Keep the legacy answer projection ephemeral: the interaction is
+          // the authoritative copy, while direct adapters receive it in the
+          // wake prompt for this invocation only.
+          const adapterContext: Record<string, unknown> = {
+            ...context,
+            ...(legacyQuestionResponse
+              ? {
+                  [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
+                    ...parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]),
+                    questionResponse: legacyQuestionResponse,
+                  },
+                }
+              : {}),
+          };
           const runtimeTools = createAdapterRuntimeToolAccess({
             agentId: agent.id,
             companyId: agent.companyId,
@@ -19788,14 +19812,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     try {
       if (running) {
         await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
+          pid: running.child.pid,
+          processGroupId: running.processGroupId,
           graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
         });
       }
     } finally {
@@ -19862,16 +19881,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const running = runningProcesses.get(run.id);
       if (running) {
         await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
+          pid: running.child.pid,
+          processGroupId: running.processGroupId,
           graceMs: Math.max(1, running.graceSec) * 1000,
         });
         runningProcesses.delete(run.id);
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
       }
       await releaseIssueExecutionAndPromote(run);
     }
