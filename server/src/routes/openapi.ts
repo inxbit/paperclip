@@ -7592,7 +7592,7 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "get",
-  path: "/api/tools/oauth/paperclip-id/callback",
+  path: "/api/tools/oauth/cloud-connector/callback",
   tags: ["tool-access"],
   summary: "Handle a brokered Paperclip ID OAuth callback",
 });

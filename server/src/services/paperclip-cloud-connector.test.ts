@@ -9,13 +9,13 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  createPaperclipIdGmailConnector,
+  createPaperclipCloudConnector,
   GMAIL_CONNECTOR_SCOPES,
   GOOGLE_WORKSPACE_CONNECTOR_PROFILES,
-  paperclipIdGmailConnectorConfigFromEnv,
-  PaperclipIdConnectorError,
-  type PaperclipIdGmailConnectorConfig,
-} from "./paperclip-id-gmail-connector.js";
+  paperclipCloudConnectorConfigFromEnv,
+  PaperclipCloudConnectorError,
+  type PaperclipCloudConnectorConfig,
+} from "./paperclip-cloud-connector.js";
 
 const instanceId = "inst_test";
 const companyId = "company_test";
@@ -32,47 +32,53 @@ function config() {
   const sealing = generateKeyPairSync("x25519");
   return {
     config: {
-      baseUrl: "https://id.example.test",
+      baseUrl: "https://my.example.test",
       instanceId,
       environment: "staging",
       signPrivateKey: rawPrivateKey(signing.privateKey),
       sealPrivateKey: rawPrivateKey(sealing.privateKey),
-    } satisfies PaperclipIdGmailConnectorConfig,
+    } satisfies PaperclipCloudConnectorConfig,
     sealPublicKey: sealing.publicKey,
   };
 }
 
-describe("Paperclip ID Gmail connector", () => {
+describe("Paperclip Cloud connector", () => {
   it("starts a signed session with exact endpoint audience and scope contract", async () => {
     const keys = config();
     const request = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as { request: string };
-      const [, encodedClaims] = body.request.split(".");
+      const [encodedHeader, encodedClaims] = body.request.split(".");
+      expect(JSON.parse(Buffer.from(encodedHeader!, "base64url").toString("utf8"))).toEqual({
+        alg: "EdDSA",
+        typ: "paperclip-cloud-connector-request+jwt",
+      });
       const claims = JSON.parse(Buffer.from(encodedClaims!, "base64url").toString("utf8"));
       expect(claims).toMatchObject({
         iss: instanceId,
-        aud: "https://id.example.test/api/connect/sessions",
+        aud: "https://my.example.test/v1/connector/sessions",
         sub: subject,
         cid: companyId,
         env: "staging",
         op: "session",
-        ruri: "https://paperclip.example.test/api/tools/oauth/paperclip-id/callback",
+        prv: "google",
+        prf: "gmail.draft",
+        scp: [...GMAIL_CONNECTOR_SCOPES],
+        ruri: "https://paperclip.example.test/api/tools/oauth/cloud-connector/callback",
         rst: "state-1",
       });
       return Response.json({
-        authorizationUrl: "https://accounts.google.com/o/oauth2/v2/auth?state=broker-state",
+        confirmationUrl: "https://my.example.test/connections/confirm?session=broker-state",
         expiresAt: "2026-08-21T20:00:00.000Z",
-        scopes: [...GMAIL_CONNECTOR_SCOPES],
       }, { status: 201 });
     });
-    const connector = createPaperclipIdGmailConnector({ config: keys.config, request: request as typeof fetch });
+    const connector = createPaperclipCloudConnector({ config: keys.config, request: request as typeof fetch });
 
     await expect(connector.startAuthorization({
       subject,
       companyId,
-      returnUri: "https://paperclip.example.test/api/tools/oauth/paperclip-id/callback",
+      returnUri: "https://paperclip.example.test/api/tools/oauth/cloud-connector/callback",
       returnState: "state-1",
-    })).resolves.toMatchObject({ authorizationUrl: expect.stringContaining("accounts.google.com") });
+    })).resolves.toMatchObject({ authorizationUrl: expect.stringContaining("/connections/confirm") });
   });
 
   it("opens an instance-sealed claim and verifies its user, company, and exact scopes", async () => {
@@ -86,14 +92,18 @@ describe("Paperclip ID Gmail connector", () => {
       scopes: [...GMAIL_CONNECTOR_SCOPES],
       subject,
       companyId,
+      instanceId,
+      environment: "staging" as const,
+      provider: "google" as const,
+      profile: "gmail.draft",
     };
-    const sealed = seal(credentials, keys.sealPublicKey, "gmail-initial-tokens", keys.config);
+    const sealed = seal(credentials, keys.sealPublicKey, "initial", keys.config, "gmail.draft");
     const request = vi.fn(async () => Response.json({
       claimId: "clm_test",
       scopes: [...GMAIL_CONNECTOR_SCOPES],
       sealed,
     }));
-    const connector = createPaperclipIdGmailConnector({ config: keys.config, request: request as typeof fetch });
+    const connector = createPaperclipCloudConnector({ config: keys.config, request: request as typeof fetch });
 
     await expect(connector.claim({ subject, companyId, claimId: "clm_test" })).resolves.toEqual(credentials);
   });
@@ -110,9 +120,12 @@ describe("Paperclip ID Gmail connector", () => {
       scopes: [...GOOGLE_WORKSPACE_CONNECTOR_PROFILES[profile].scopes],
       subject,
       companyId,
+      instanceId,
+      environment: "staging" as const,
+      provider: "google" as const,
       profile,
     };
-    const sealed = seal(credentials, keys.sealPublicKey, "google-workspace-initial-tokens", keys.config, profile);
+    const sealed = seal(credentials, keys.sealPublicKey, "initial", keys.config, profile);
     const request = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as { request: string };
       const [, encodedClaims] = body.request.split(".");
@@ -120,7 +133,7 @@ describe("Paperclip ID Gmail connector", () => {
       expect(claims.prf).toBe(profile);
       return Response.json({ claimId: "clm_drive", scopes: credentials.scopes, sealed });
     });
-    const connector = createPaperclipIdGmailConnector({ config: keys.config, request: request as typeof fetch });
+    const connector = createPaperclipCloudConnector({ config: keys.config, request: request as typeof fetch });
 
     await expect(connector.claim({ subject, companyId, profile, claimId: "clm_drive" })).resolves.toEqual(credentials);
   });
@@ -128,10 +141,14 @@ describe("Paperclip ID Gmail connector", () => {
   it("accepts only the current capability protocol and known profiles", async () => {
     const keys = config();
     const request = vi.fn(async () => Response.json({
-      protocolVersion: 2,
-      profiles: ["gmail.read", "drive.write", "unknown.profile"],
+      providers: [{ key: "google", profiles: [
+        { key: "gmail.read", enabled: true },
+        { key: "drive.write", enabled: true },
+        { key: "unknown.profile", enabled: true },
+        { key: "gmail.draft", enabled: false },
+      ] }],
     }));
-    const connector = createPaperclipIdGmailConnector({ config: keys.config, request: request as typeof fetch });
+    const connector = createPaperclipCloudConnector({ config: keys.config, request: request as typeof fetch });
     await expect(connector.getCapabilities()).resolves.toEqual(["gmail.read", "drive.write"]);
   });
 
@@ -140,26 +157,33 @@ describe("Paperclip ID Gmail connector", () => {
     const request = vi.fn(async () => new Response(JSON.stringify({
       error: "provider rejected access-secret refresh-secret",
     }), { status: 502 }));
-    const connector = createPaperclipIdGmailConnector({ config: keys.config, request: request as typeof fetch });
+    const connector = createPaperclipCloudConnector({ config: keys.config, request: request as typeof fetch });
 
     const error = await connector.refresh({ subject, companyId, refreshToken: "refresh-secret" }).catch((caught) => caught);
-    expect(error).toBeInstanceOf(PaperclipIdConnectorError);
+    expect(error).toBeInstanceOf(PaperclipCloudConnectorError);
     expect(String(error)).not.toContain("access-secret");
     expect(String(error)).not.toContain("refresh-secret");
     expect(request).toHaveBeenCalledOnce();
   });
 
   it("requires an all-or-nothing environment configuration and loopback for HTTP", () => {
-    expect(paperclipIdGmailConnectorConfigFromEnv({})).toBeNull();
-    expect(() => paperclipIdGmailConnectorConfigFromEnv({
-      PAPERCLIP_ID_CONNECTOR_INSTANCE_ID: instanceId,
+    expect(paperclipCloudConnectorConfigFromEnv({})).toBeNull();
+    expect(() => paperclipCloudConnectorConfigFromEnv({
+      PAPERCLIP_CLOUD_CONNECTOR_INSTANCE_ID: instanceId,
     })).toThrowError(/incomplete/);
-    expect(() => paperclipIdGmailConnectorConfigFromEnv({
+    expect(() => paperclipCloudConnectorConfigFromEnv({
+      PAPERCLIP_CLOUD_CONNECTOR_INSTANCE_ID: instanceId,
+      PAPERCLIP_CLOUD_CONNECTOR_SIGN_PRIVATE_KEY: "key",
+      PAPERCLIP_CLOUD_CONNECTOR_SEAL_PRIVATE_KEY: "key",
+      PAPERCLIP_CLOUD_CONNECTOR_ENVIRONMENT: "development",
+      PAPERCLIP_CLOUD_CONNECTOR_BASE_URL: "http://my.example.test",
+    })).toThrowError(/HTTPS/);
+    expect(() => paperclipCloudConnectorConfigFromEnv({
       PAPERCLIP_ID_CONNECTOR_INSTANCE_ID: instanceId,
       PAPERCLIP_ID_CONNECTOR_SIGN_PRIVATE_KEY: "key",
       PAPERCLIP_ID_CONNECTOR_SEAL_PRIVATE_KEY: "key",
       PAPERCLIP_ID_CONNECTOR_ENVIRONMENT: "development",
-      PAPERCLIP_ID_CONNECTOR_BASE_URL: "http://id.example.test",
+      PAPERCLIP_ID_CONNECTOR_BASE_URL: "http://my.example.test",
     })).toThrowError(/HTTPS/);
   });
 });
@@ -167,9 +191,9 @@ describe("Paperclip ID Gmail connector", () => {
 function seal(
   payload: unknown,
   recipientPublicKey: KeyObject,
-  purpose: "gmail-initial-tokens" | "gmail-access-token" | "google-workspace-initial-tokens" | "google-workspace-access-token",
-  configValue: PaperclipIdGmailConnectorConfig,
-  profile?: string,
+  purpose: "initial" | "access",
+  configValue: PaperclipCloudConnectorConfig,
+  profile: keyof typeof GOOGLE_WORKSPACE_CONNECTOR_PROFILES,
 ) {
   const ephemeral = generateKeyPairSync("x25519");
   const ephemeralJwk = ephemeral.publicKey.export({ format: "jwk" }) as { x: string };
@@ -182,7 +206,9 @@ function seal(
     purpose,
     configValue.instanceId,
     configValue.environment,
-    ...(profile ? [profile] : []),
+    "google",
+    profile,
+    [...GOOGLE_WORKSPACE_CONNECTOR_PROFILES[profile].scopes].sort().join(" "),
   ].join("\n"));
   const key = Buffer.from(hkdfSync(
     "sha256",
@@ -199,6 +225,8 @@ function seal(
     v: 1,
     alg: "X25519-HKDF-SHA256-A256GCM",
     purpose,
+    provider: "google",
+    profile,
     epk: ephemeralJwk.x,
     iv: iv.toString("base64url"),
     ct: ciphertext.toString("base64url"),

@@ -91,11 +91,12 @@ import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
 import { composioChildConfig, createComposioSessionManager } from "./composio-session-manager.js";
 import type { ComposioClient } from "./composio.js";
 import {
-  createPaperclipIdGmailConnector,
-  paperclipIdGmailConnectorConfigFromEnv,
-  PaperclipIdConnectorError,
-  type PaperclipIdGmailConnector,
-} from "./paperclip-id-gmail-connector.js";
+  createPaperclipCloudConnector,
+  isPaperclipCloudConnectorStrategy,
+  paperclipCloudConnectorConfigFromEnv,
+  PaperclipCloudConnectorError,
+  type PaperclipCloudConnector,
+} from "./paperclip-cloud-connector.js";
 import {
   createVercelConnectClient,
   vercelGrantReference,
@@ -832,7 +833,9 @@ export function createToolGatewayService(
     /** Test seam for Composio session creation without vendor traffic. */
     composioClientFactory?: (apiKey: string) => ComposioClient;
     /** Test seam for refreshing personal Gmail grants. */
-    paperclipIdGmailConnector?: PaperclipIdGmailConnector | null;
+    paperclipCloudConnector?: PaperclipCloudConnector | null;
+    /** @deprecated Use paperclipCloudConnector. */
+    paperclipIdGmailConnector?: PaperclipCloudConnector | null;
     /** Refreshes customer-owned/DCR OAuth grants before remote MCP execution. */
     oauthGrantRefresher?: (input: {
       companyId: string;
@@ -871,13 +874,17 @@ export function createToolGatewayService(
   const interactions = issueThreadInteractionService(db);
   const policyService = toolAccessPolicyService(db);
   const secrets = secretService(db);
-  const gmailConnectorConfig = options.paperclipIdGmailConnector === undefined
-    ? paperclipIdGmailConnectorConfigFromEnv()
-    : null;
-  const gmailConnector = options.paperclipIdGmailConnector
-    ?? (gmailConnectorConfig
-      ? createPaperclipIdGmailConnector({ config: gmailConnectorConfig, now: options.now })
-      : null);
+  const configuredCloudConnector = options.paperclipCloudConnector ?? options.paperclipIdGmailConnector;
+  const connectorWasProvided = options.paperclipCloudConnector !== undefined || options.paperclipIdGmailConnector !== undefined;
+  let cachedCloudConnector = configuredCloudConnector ?? null;
+  const currentCloudConnector = (): PaperclipCloudConnector | null => {
+    if (cachedCloudConnector || connectorWasProvided) return cachedCloudConnector;
+    const config = paperclipCloudConnectorConfigFromEnv();
+    cachedCloudConnector = config
+      ? createPaperclipCloudConnector({ config, now: options.now })
+      : null;
+    return cachedCloudConnector;
+  };
   const gmailRefreshFlights = new Map<string, Promise<typeof connectionGrants.$inferSelect>>();
   const vercelConnect = options.vercelConnectClient === undefined
     ? createVercelConnectClient()
@@ -2618,13 +2625,13 @@ export function createToolGatewayService(
     return resolved.value;
   }
 
-  async function maybeRefreshPaperclipIdGoogleGrant(
+  async function maybeRefreshPaperclipCloudGoogleGrant(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
     grant: typeof connectionGrants.$inferSelect,
   ): Promise<typeof connectionGrants.$inferSelect> {
     const oauth = asRecord(asRecord(connection.config)?.oauth);
-    if (oauth?.strategy !== "paperclip_id_connector") return grant;
+    if (!oauth || !isPaperclipCloudConnectorStrategy(oauth.strategy)) return grant;
     const configuredProfile = oauth.connectorProfile;
     const connectorProfile: GoogleWorkspaceConnectorProfileId = configuredProfile === undefined
       ? "gmail.draft"
@@ -2648,7 +2655,8 @@ export function createToolGatewayService(
     const existingFlight = gmailRefreshFlights.get(grant.id);
     if (existingFlight) return existingFlight;
     const refresh = (async () => {
-      if (!gmailConnector || !connectorSubject) {
+      const cloudConnector = currentCloudConnector();
+      if (!cloudConnector || !connectorSubject) {
         await db.update(connectionGrants).set({ status: "needs_reauthorization", updatedAt: new Date(currentTime) })
           .where(eq(connectionGrants.id, grant.id));
         throw new ToolGatewayHttpError(409, "Google authorization must be reconnected", "google_reauthorization_required", {
@@ -2668,7 +2676,7 @@ export function createToolGatewayService(
       }
       const refreshToken = await resolveGrantSecretValue(session, connection, grant, refreshRef);
       try {
-        const credentials = await gmailConnector.refresh({
+        const credentials = await cloudConnector.refresh({
           subject: connectorSubject,
           companyId: connection.companyId,
           profile: connectorProfile,
@@ -2682,7 +2690,7 @@ export function createToolGatewayService(
           ...(grant.providerTenant ?? {}),
           oauth: {
             ...(grant.providerTenant?.oauth ?? {}),
-            strategy: "paperclip_id_connector",
+            strategy: "paperclip_cloud_connector",
             accessTokenExpiresAt: credentials.accessTokenExpiresAt,
             scopes: credentials.scopes,
             tokenType: credentials.tokenType,
@@ -2700,7 +2708,7 @@ export function createToolGatewayService(
         return updated;
       } catch (error) {
         if (error instanceof ToolGatewayHttpError) throw error;
-        if (error instanceof PaperclipIdConnectorError && error.code === "REAUTHORIZATION_REQUIRED") {
+        if (error instanceof PaperclipCloudConnectorError && error.code === "REAUTHORIZATION_REQUIRED") {
           await db.update(connectionGrants).set({ status: "needs_reauthorization", updatedAt: new Date(options.now?.() ?? Date.now()) })
             .where(eq(connectionGrants.id, grant.id));
           throw new ToolGatewayHttpError(409, "Google authorization must be reconnected", "google_reauthorization_required", {
@@ -2814,12 +2822,12 @@ export function createToolGatewayService(
         });
       }
     }
-    grant = await maybeRefreshPaperclipIdGoogleGrant(session, connection, grant);
+    grant = await maybeRefreshPaperclipCloudGoogleGrant(session, connection, grant);
     const oauth = asRecord(asRecord(connection.config)?.oauth);
     if (
       connection.authKind === "oauth"
       && connection.credentialSource === "paperclip_vault"
-      && oauth?.strategy !== "paperclip_id_connector"
+      && !isPaperclipCloudConnectorStrategy(oauth?.strategy)
       && options.oauthGrantRefresher
     ) {
       try {
@@ -3933,7 +3941,7 @@ export function createToolGatewayService(
         response.status === 401
         && connection.authKind === "oauth"
         && connection.credentialSource === "paperclip_vault"
-        && oauth?.strategy !== "paperclip_id_connector"
+        && !isPaperclipCloudConnectorStrategy(oauth?.strategy)
         && options.oauthGrantRefresher
       ) {
         credentialHeaders = {

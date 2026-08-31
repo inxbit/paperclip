@@ -63,8 +63,8 @@ import type { ComposioClient } from "../services/composio.js";
 import type { VercelConnectClient } from "../services/vercel-connect.js";
 import {
   GMAIL_CONNECTOR_SCOPES,
-  type PaperclipIdGmailConnector,
-} from "../services/paperclip-id-gmail-connector.js";
+  type PaperclipCloudConnector,
+} from "../services/paperclip-cloud-connector.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -85,7 +85,7 @@ function createTestToolAccessService(
   });
 }
 
-function fakeGmailConnector(companyId: string, userId: string): PaperclipIdGmailConnector {
+function fakeGmailConnector(companyId: string, userId: string): PaperclipCloudConnector {
   const credentials = {
     v: 1 as const,
     accessToken: "gmail-access-token",
@@ -95,8 +95,13 @@ function fakeGmailConnector(companyId: string, userId: string): PaperclipIdGmail
     scopes: [...GMAIL_CONNECTOR_SCOPES],
     subject: userId,
     companyId,
+    instanceId: "test-instance",
+    environment: "development" as const,
+    provider: "google" as const,
+    profile: "gmail.draft",
   };
   return {
+    getCapabilities: vi.fn(async () => ["gmail.draft" as const]),
     startAuthorization: vi.fn(async ({ returnState }) => ({
       authorizationUrl: `https://accounts.google.com/o/oauth2/v2/auth?state=${encodeURIComponent(returnState)}`,
       expiresAt: new Date(Date.now() + 600_000).toISOString(),
@@ -4823,7 +4828,7 @@ describeEmbeddedPostgres("tool access service", () => {
     await grantBoardUser(db, company.id, userId, []);
     const callbackDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
     const service = createTestToolAccessService(callbackDb, {
-      paperclipIdGmailConnector: fakeGmailConnector(company.id, userId),
+      paperclipCloudConnector: fakeGmailConnector(company.id, userId),
     });
     const actor = { actorType: "user" as const, actorId: userId };
     const gmailDefinition = getConnectableAppDefinition("gmail")!;
@@ -4841,13 +4846,13 @@ describeEmbeddedPostgres("tool access service", () => {
         name: "Gmail single-pool callback",
       }, actor);
       const started = await service.startOAuth(company.id, connected.connectionId, {
-        redirectUri: "https://paperclip.example/api/tools/oauth/paperclip-id/callback",
+        redirectUri: "https://paperclip.example/api/tools/oauth/cloud-connector/callback",
         actor,
       });
       const state = new URL(started.authorizationUrl).searchParams.get("state")!;
 
       const completed = await Promise.race([
-        service.completePaperclipIdGmailCallback({ state, claimId: "gmail-claim", actor }),
+        service.completePaperclipCloudConnectorCallback({ state, claimId: "gmail-claim", actor }),
         new Promise<never>((_resolve, reject) => {
           deadline = setTimeout(() => {
             void callbackDb.$client.end({ timeout: 0 })
@@ -4881,7 +4886,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const callbackDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
     const removalDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
     const service = createTestToolAccessService(callbackDb, {
-      paperclipIdGmailConnector: fakeGmailConnector(company.id, userId),
+      paperclipCloudConnector: fakeGmailConnector(company.id, userId),
     });
     const actor = { actorType: "user" as const, actorId: userId };
     const gmailDefinition = getConnectableAppDefinition("gmail")!;
@@ -4906,7 +4911,7 @@ describeEmbeddedPostgres("tool access service", () => {
         name: "Gmail concurrent revocation callback",
       }, actor);
       const started = await service.startOAuth(company.id, connected.connectionId, {
-        redirectUri: "https://paperclip.example/api/tools/oauth/paperclip-id/callback",
+        redirectUri: "https://paperclip.example/api/tools/oauth/cloud-connector/callback",
         actor,
       });
       const state = new URL(started.authorizationUrl).searchParams.get("state")!;
@@ -4935,7 +4940,7 @@ describeEmbeddedPostgres("tool access service", () => {
       });
 
       await membershipIsLocked;
-      const completion = service.completePaperclipIdGmailCallback({
+      const completion = service.completePaperclipCloudConnectorCallback({
         state,
         claimId: "gmail-claim",
         actor,

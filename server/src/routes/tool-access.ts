@@ -53,7 +53,15 @@ import { accessService, logActivity, toolAccessPolicyService, toolAccessService,
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
 import type { ComposioClient } from "../services/composio.js";
 import type { VercelConnectClient } from "../services/vercel-connect.js";
-import { paperclipIdGoogleConnectorCapabilitiesFromEnv } from "../services/paperclip-id-gmail-connector.js";
+import {
+  isPaperclipCloudConnectorStrategy,
+  paperclipCloudConnectorCapabilitiesFromEnv,
+} from "../services/paperclip-cloud-connector.js";
+import {
+  completePaperclipCloudConnectorEnrollment,
+  paperclipCloudConnectorEnrollmentStatus,
+  startPaperclipCloudConnectorEnrollment,
+} from "../services/paperclip-cloud-connector-enrollment.js";
 import {
   OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
   oauthClientIdMetadataDocument,
@@ -662,7 +670,7 @@ export function toolAccessRoutes(
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const googleConnectorProfiles = new Set(await paperclipIdGoogleConnectorCapabilitiesFromEnv());
+    const googleConnectorProfiles = new Set(await paperclipCloudConnectorCapabilitiesFromEnv());
     const vercelConnect = vercelConnectIntegrationStatus();
     res.json({
       capabilities: await describeConnectionCreateCapabilities(req, companyId),
@@ -681,7 +689,7 @@ export function toolAccessRoutes(
       },
       apps: APP_STORE_DEFINITIONS.map((app) => {
         const methods = app.methods.filter((method) =>
-          method.oauthStrategy !== "paperclip_id_connector"
+          !isPaperclipCloudConnectorStrategy(method.oauthStrategy)
           || Boolean(method.connectorProfile && googleConnectorProfiles.has(method.connectorProfile as never))
         );
         return {
@@ -689,7 +697,7 @@ export function toolAccessRoutes(
           methods,
           ownershipAvailability: {
             ...DEFAULT_OWNERSHIP_AVAILABILITY,
-            platform_shared: methods.some((method) => method.oauthStrategy === "paperclip_id_connector"),
+            platform_shared: methods.some((method) => isPaperclipCloudConnectorStrategy(method.oauthStrategy)),
           },
         };
       }),
@@ -826,7 +834,42 @@ export function toolAccessRoutes(
     res.json(result);
   });
 
-  router.get("/tools/oauth/paperclip-id/callback", async (req, res) => {
+  router.get("/tools/oauth/cloud-connector/enrollment", async (req, res) => {
+    assertBoard(req);
+    res.json(paperclipCloudConnectorEnrollmentStatus());
+  });
+
+  router.post("/tools/oauth/cloud-connector/enrollment", async (req, res) => {
+    assertBoard(req);
+    const origin = new URL(oauthRedirectUri(req)).origin;
+    try {
+      const status = await startPaperclipCloudConnectorEnrollment({
+        origin,
+        label: typeof req.body?.label === "string" ? req.body.label : undefined,
+      });
+      res.status(201).json(status);
+    } catch {
+      throw unprocessable("Paperclip Cloud enrollment could not be started", {
+        code: "paperclip_cloud_connector_enrollment_failed",
+      });
+    }
+  });
+
+  router.get("/tools/oauth/cloud-connector/enrollment-callback", async (req, res) => {
+    assertBoard(req);
+    const enrollmentId = typeof req.query.enrollment_id === "string" ? req.query.enrollment_id : "";
+    const approvalCode = typeof req.query.approval_code === "string" ? req.query.approval_code : "";
+    const state = typeof req.query.state === "string" ? req.query.state : "";
+    if (!enrollmentId || !approvalCode || !state) throw badRequest("Invalid Paperclip Cloud enrollment callback");
+    try {
+      await completePaperclipCloudConnectorEnrollment({ enrollmentId, approvalCode, state });
+    } catch {
+      throw badRequest("Invalid or expired Paperclip Cloud enrollment callback");
+    }
+    res.redirect(303, "/apps/connections?cloud_connector=enrolled");
+  });
+
+  router.get(["/tools/oauth/cloud-connector/callback", "/tools/oauth/paperclip-id/callback"], async (req, res) => {
     assertBoard(req);
     const state = typeof req.query.state === "string" ? req.query.state : "";
     const claimId = typeof req.query.claim_id === "string" ? req.query.claim_id : null;
@@ -844,7 +887,7 @@ export function toolAccessRoutes(
     }
     const acceptsHtml = req.get("accept")?.includes("text/html") === true;
     try {
-      const result = await svc.completePaperclipIdGmailCallback({
+      const result = await svc.completePaperclipCloudConnectorCallback({
         state,
         claimId,
         error,

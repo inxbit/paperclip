@@ -169,10 +169,11 @@ import { listConnectionLifecycleEvents } from "./tool-connection-activity.js";
 import { ComposioApiError, createComposioClient, type ComposioClient } from "./composio.js";
 import { composioChildConfig, createComposioSessionManager } from "./composio-session-manager.js";
 import {
-  createPaperclipIdGmailConnector,
-  paperclipIdGmailConnectorConfigFromEnv,
-  type PaperclipIdGmailConnector,
-} from "./paperclip-id-gmail-connector.js";
+  createPaperclipCloudConnector,
+  isPaperclipCloudConnectorStrategy,
+  paperclipCloudConnectorConfigFromEnv,
+  type PaperclipCloudConnector,
+} from "./paperclip-cloud-connector.js";
 import {
   createVercelConnectClient,
   deriveVercelConnectSubject,
@@ -519,7 +520,9 @@ type ToolAccessServiceOptions = {
   /** Test seam for Composio without live vendor traffic. */
   composioClientFactory?: (apiKey: string) => ComposioClient;
   /** Test seam for the centrally registered Gmail OAuth broker. */
-  paperclipIdGmailConnector?: PaperclipIdGmailConnector | null;
+  paperclipCloudConnector?: PaperclipCloudConnector | null;
+  /** @deprecated Use paperclipCloudConnector. */
+  paperclipIdGmailConnector?: PaperclipCloudConnector | null;
   /** Test seam for Vercel Connect without live vendor traffic. */
   vercelConnectClient?: VercelConnectClient | null;
 };
@@ -2078,13 +2081,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   });
   const policySvc = toolAccessPolicyService(db);
   const now = options.now ?? (() => new Date());
-  const gmailConnectorConfig = options.paperclipIdGmailConnector === undefined
-    ? paperclipIdGmailConnectorConfigFromEnv()
-    : null;
-  const gmailConnector = options.paperclipIdGmailConnector
-    ?? (gmailConnectorConfig
-      ? createPaperclipIdGmailConnector({ config: gmailConnectorConfig, now: () => now().getTime() })
-      : null);
+  const configuredCloudConnector = options.paperclipCloudConnector ?? options.paperclipIdGmailConnector;
+  const connectorWasProvided = options.paperclipCloudConnector !== undefined || options.paperclipIdGmailConnector !== undefined;
+  let cachedCloudConnector = configuredCloudConnector ?? null;
+  const currentCloudConnector = (): PaperclipCloudConnector | null => {
+    if (cachedCloudConnector || connectorWasProvided) return cachedCloudConnector;
+    const config = paperclipCloudConnectorConfigFromEnv();
+    cachedCloudConnector = config
+      ? createPaperclipCloudConnector({ config, now: () => now().getTime() })
+      : null;
+    return cachedCloudConnector;
+  };
   const vercelConnect = options.vercelConnectClient === undefined
     ? createVercelConnectClient()
     : options.vercelConnectClient;
@@ -4896,7 +4903,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       response.status === 401
       && connection.authKind === "oauth"
       && connection.credentialSource === "paperclip_vault"
-      && oauthConfig(connection).strategy !== "paperclip_id_connector"
+      && !isPaperclipCloudConnectorStrategy(oauthConfig(connection).strategy)
     ) {
       headers = {
         ...projectedConnectionHeaders(connection),
@@ -8012,7 +8019,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     if (
       connection.authKind !== "oauth"
       || connection.credentialSource !== "paperclip_vault"
-      || oauth.strategy === "paperclip_id_connector"
+      || isPaperclipCloudConnectorStrategy(oauth.strategy)
       || !oauthTokenUrl
       || !oauthProvider
     ) {
@@ -8511,7 +8518,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           ...(galleryEntry.slug === "posthog" ? { safeDefault: true } : {}),
         }
       : { ...baseConfig, quarantineNewEntries: false, unverifiedServer: true };
-    if (method?.oauthStrategy === "paperclip_id_connector") {
+    if (method && isPaperclipCloudConnectorStrategy(method.oauthStrategy)) {
       const connectorProfile = method.connectorProfile;
       if (!connectorProfile || !isGoogleWorkspaceConnectorProfileId(connectorProfile)) {
         throw badRequest("This app has an invalid Google connector profile");
@@ -8618,7 +8625,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       const credentialPolicy: ToolConnectionCredentialPolicy | undefined = personalIdentityUserId
       ? "per_user"
         : undefined;
-    const connectionOwnership = method?.oauthStrategy === "paperclip_id_connector" ? "platform_shared" : "customer";
+    const connectionOwnership = isPaperclipCloudConnectorStrategy(method?.oauthStrategy) ? "platform_shared" : "customer";
     let applicationRow: typeof toolApplications.$inferSelect | null = null;
     let connectionRow: typeof toolConnections.$inferSelect | null = null;
     let revivedConnectionPrevious: typeof toolConnections.$inferSelect | null = retainedConnection ?? null;
@@ -9650,16 +9657,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         registrationSource: null,
       };
     }
-    if (galleryMethod?.oauthStrategy === "paperclip_id_connector") {
+    if (galleryMethod && isPaperclipCloudConnectorStrategy(galleryMethod.oauthStrategy)) {
       const connectorProfile = galleryMethod.connectorProfile;
       if (!connectorProfile || !isGoogleWorkspaceConnectorProfileId(connectorProfile)) {
         throw badRequest("This app has an invalid Google connector profile");
       }
       const googleProfile = GOOGLE_WORKSPACE_CONNECTOR_PROFILES[connectorProfile];
       const providerName = galleryEntry?.name ?? "Google Workspace";
-      if (!gmailConnector) {
+      const cloudConnector = currentCloudConnector();
+      if (!cloudConnector) {
         throw unprocessable(`${providerName} connections through Paperclip are not available on this instance yet`, {
-          code: "paperclip_id_connector_unavailable",
+          code: "paperclip_cloud_connector_unavailable",
         });
       }
       const binding = starterBinding;
@@ -9676,10 +9684,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       await db.delete(toolOauthStates).where(lt(toolOauthStates.expiresAt, now()));
       const state = randomOauthToken();
       const returnUri = new URL(input.redirectUri);
-      returnUri.pathname = "/api/tools/oauth/paperclip-id/callback";
+      returnUri.pathname = "/api/tools/oauth/cloud-connector/callback";
       returnUri.search = "";
       returnUri.hash = "";
-      const session = await gmailConnector.startAuthorization({
+      const session = await cloudConnector.startAuthorization({
         subject: subjectUserId,
         companyId,
         profile: connectorProfile,
@@ -9694,9 +9702,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         state,
         companyId,
         connectionId: connection.id,
-        // Paperclip ID owns PKCE for this flow. The local state row remains the
+        // Paperclip Cloud owns PKCE for this flow. The local state row remains the
         // single-use browser correlator and never stores broker token material.
-        codeVerifier: "paperclip-id-connector",
+        codeVerifier: "paperclip-cloud-connector",
         createdByActorType: binding.actorType,
         createdByActorId: binding.actorId,
         createdBySessionId: binding.sessionId,
@@ -9709,7 +9717,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       });
       return {
         connectionId: connection.id,
-        provider: "gmail",
+        provider: "google",
         authorizationUrl: session.authorizationUrl,
         expiresAt: expiresAt.toISOString(),
         issuer: "https://accounts.google.com",
@@ -10078,7 +10086,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return finished;
   }
 
-  async function completePaperclipIdGmailCallback(input: {
+  async function completePaperclipCloudConnectorCallback(input: {
     state: string;
     claimId?: string | null;
     error?: string | null;
@@ -10093,23 +10101,24 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     if (input.error) {
       await rejectPendingOAuthInteraction(stateRow, input.actor);
       throw new HttpError(400, `Google authorization did not complete. Start a new ${providerName} connection to try again.`, {
-        code: input.error === "access_denied" ? "oauth_authorization_denied" : "paperclip_id_connector_failed",
+        code: input.error === "access_denied" ? "oauth_authorization_denied" : "paperclip_cloud_connector_failed",
       });
     }
     if (!input.claimId) throw badRequest(`${providerName} callback is missing a claim identifier`);
-    if (!gmailConnector) {
+    const cloudConnector = currentCloudConnector();
+    if (!cloudConnector) {
       throw unprocessable(`${providerName} connections through Paperclip are not available on this instance yet`, {
-        code: "paperclip_id_connector_unavailable",
+        code: "paperclip_cloud_connector_unavailable",
       });
     }
     const subjectUserId = stateRow.subjectUserId;
-    if (method?.oauthStrategy !== "paperclip_id_connector" || !subjectUserId) {
+    if (!method || !isPaperclipCloudConnectorStrategy(method.oauthStrategy) || !subjectUserId) {
       throw badRequest("OAuth state does not belong to a Google connector flow");
     }
     const connectorProfile = method.connectorProfile;
     if (!connectorProfile || !isGoogleWorkspaceConnectorProfileId(connectorProfile)) throw badRequest("Google connector profile is invalid");
     const profile = GOOGLE_WORKSPACE_CONNECTOR_PROFILES[connectorProfile];
-    const credentials = await gmailConnector.claim({
+    const credentials = await cloudConnector.claim({
       subject: subjectUserId,
       companyId: stateRow.companyId,
       profile: connectorProfile,
@@ -10175,7 +10184,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           name: providerName,
           externalId: credentials.subject,
           oauth: {
-            strategy: "paperclip_id_connector",
+            strategy: "paperclip_cloud_connector",
             accessTokenExpiresAt: credentials.accessTokenExpiresAt,
             scopes: credentials.scopes,
             tokenType: credentials.tokenType,
@@ -10205,7 +10214,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         ...connection.config,
         oauth: {
           ...oauthConfig(connection),
-          strategy: "paperclip_id_connector",
+          strategy: "paperclip_cloud_connector",
           provider: galleryEntry?.slug,
           connectorProfile,
           connectorSubjectUserId: subjectUserId,
@@ -11241,7 +11250,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     peekOAuthState,
 
-    completePaperclipIdGmailCallback,
+    completePaperclipCloudConnectorCallback,
 
     completeVercelConnectCallback,
 
@@ -11929,7 +11938,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             providerRevocation = "failed";
           }
         }
-      } else if (oauthConfig(connection).strategy === "paperclip_id_connector" && gmailConnector) {
+      } else if (isPaperclipCloudConnectorStrategy(oauthConfig(connection).strategy) && currentCloudConnector()) {
+        const cloudConnector = currentCloudConnector()!;
         const connectorOauth = oauthConfig(connection);
         const connectorSubject = currentGrant.subjectUserId ?? readConfigString(connectorOauth, "connectorSubjectUserId");
         const connectorProfile = readConfigString(connectorOauth, "connectorProfile");
@@ -11952,7 +11962,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             if (!connectorSubject || !connectorProfile || !isGoogleWorkspaceConnectorProfileId(connectorProfile)) {
               throw new Error("Google connector binding is incomplete");
             }
-            await gmailConnector.revoke({
+            await cloudConnector.revoke({
               subject: connectorSubject,
               companyId: connection.companyId,
               profile: connectorProfile,
