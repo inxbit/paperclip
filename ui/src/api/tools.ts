@@ -102,7 +102,7 @@ export type ToolGalleryResponse = {
 export type ToolMcpGatewaysResponse = { gateways: ToolMcpGatewayWithTokens[] };
 export type CloudConnectorEnrollmentStatus = {
   configured: boolean;
-  status: "not_configured" | "unenrolled" | "pending" | "active";
+  status: "not_configured" | "unenrolled" | "pending" | "active" | "suspended" | "unverified";
   brokerBaseUrl: string;
   instanceId: string | null;
   environment: "development" | "staging" | "production";
@@ -288,8 +288,8 @@ export type ToolPolicyTestResponse = {
 export const toolsApi = {
   getCloudConnectorEnrollment: () =>
     api.get<CloudConnectorEnrollmentStatus>("/tools/oauth/cloud-connector/enrollment"),
-  startCloudConnectorEnrollment: (label?: string) =>
-    api.post<CloudConnectorEnrollmentStatus>("/tools/oauth/cloud-connector/enrollment", { label }),
+  startCloudConnectorEnrollment: (companyId: string, label?: string) =>
+    api.post<CloudConnectorEnrollmentStatus>("/tools/oauth/cloud-connector/enrollment", { companyId, label }),
   // --- Applications ---
   listGallery: (companyId: string) =>
     api.get<ToolGalleryResponse>(`/companies/${companyId}/tools/gallery`),

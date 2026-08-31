@@ -11,6 +11,7 @@ import {
   startPaperclipCloudConnectorEnrollment,
 } from "./paperclip-cloud-connector-enrollment.js";
 import { paperclipCloudConnectorConfigFromEnv } from "./paperclip-cloud-connector.js";
+import { reconcilePaperclipCloudConnectorEnrollmentStatus } from "./paperclip-cloud-connector-status.js";
 
 describe("Paperclip Cloud self-host enrollment", () => {
   let root = "";
@@ -94,6 +95,16 @@ describe("Paperclip Cloud self-host enrollment", () => {
     const config = paperclipCloudConnectorConfigFromEnv({});
     expect(config).toMatchObject({ baseUrl: "https://my.example.test", environment: "development" });
     expect(requests).toHaveLength(2);
+
+    const statusRequest = vi.fn(async (input: string | URL | Request) => {
+      expect(String(input)).toBe("https://my.example.test/v1/connector/instance-status");
+      return Response.json({ active: false, status: "suspended" });
+    });
+    await expect(reconcilePaperclipCloudConnectorEnrollmentStatus({}, statusRequest as typeof fetch)).resolves.toMatchObject({
+      configured: false,
+      status: "suspended",
+      instanceId: active.instanceId,
+    });
   });
 
   it("rejects non-loopback plain HTTP destinations before creating keys", async () => {
@@ -104,6 +115,44 @@ describe("Paperclip Cloud self-host enrollment", () => {
     expect(paperclipCloudConnectorEnrollmentStatus().status).toBe("not_configured");
   });
 
+  it("serializes overlapping starts and reuses one unexpired enrollment", async () => {
+    let releaseBroker!: () => void;
+    const brokerMayRespond = new Promise<void>((resolve) => {
+      releaseBroker = resolve;
+    });
+    const request = vi.fn(async () => {
+      await brokerMayRespond;
+      return Response.json({
+        enrollmentId: "enroll-shared",
+        verificationUrl: "https://my.example.test/connections/enroll?id=enroll-shared",
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }, { status: 201 });
+    });
+    const values = {
+      origin: "https://private.example.test",
+      companyId: "company-test",
+      env: {
+        PAPERCLIP_CLOUD_CONNECTOR_BASE_URL: "https://my.example.test",
+        PAPERCLIP_CLOUD_CONNECTOR_ENVIRONMENT: "development",
+      },
+      request: request as typeof fetch,
+    };
+
+    const first = startPaperclipCloudConnectorEnrollment(values);
+    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+    const second = startPaperclipCloudConnectorEnrollment(values);
+    releaseBroker();
+
+    const [firstStatus, secondStatus] = await Promise.all([first, second]);
+    expect(request).toHaveBeenCalledOnce();
+    expect(firstStatus).toMatchObject({ status: "pending", verificationUrl: expect.stringContaining("enroll-shared") });
+    expect(secondStatus).toEqual(firstStatus);
+    expect(loadPaperclipCloudConnectorIdentity()?.pending).toMatchObject({
+      enrollmentId: "enroll-shared",
+      companyId: "company-test",
+    });
+  });
+
   it("defaults an enrollment to the environment of the standard Cloud broker", () => {
     expect(paperclipCloudConnectorEnrollmentStatus({})).toMatchObject({
       brokerBaseUrl: "https://my.paperclip.app",
@@ -112,5 +161,20 @@ describe("Paperclip Cloud self-host enrollment", () => {
     expect(paperclipCloudConnectorEnrollmentStatus({
       PAPERCLIP_CLOUD_CONNECTOR_BASE_URL: "https://my-staging.paperclip.app",
     })).toMatchObject({ environment: "staging" });
+  });
+
+  it("does not treat legacy Paperclip ID keys as a Cloud enrollment", () => {
+    expect(paperclipCloudConnectorEnrollmentStatus({
+      PAPERCLIP_ID_CONNECTOR_INSTANCE_ID: "legacy-instance",
+      PAPERCLIP_ID_CONNECTOR_SIGN_PRIVATE_KEY: "legacy-signing-key",
+      PAPERCLIP_ID_CONNECTOR_SEAL_PRIVATE_KEY: "legacy-sealing-key",
+      PAPERCLIP_ID_CONNECTOR_ENVIRONMENT: "production",
+      PAPERCLIP_ID_CONNECTOR_BASE_URL: "https://id.paperclip.app",
+    })).toMatchObject({
+      configured: false,
+      status: "not_configured",
+      brokerBaseUrl: "https://my.paperclip.app",
+      instanceId: null,
+    });
   });
 });

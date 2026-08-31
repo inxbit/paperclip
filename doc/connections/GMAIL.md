@@ -283,8 +283,14 @@ Cloud-hosted stacks receive these values automatically through the existing
 per-stack secret-reference delivery path. Self-hosted instances normally use
 the Apps enrollment action instead of running the OpenSSL commands manually;
 it generates the keys and writes them to the ignored instance secret directory
-with owner-only permissions. The old `PAPERCLIP_ID_CONNECTOR_*` names remain
-read aliases during migration only.
+with owner-only permissions.
+
+`PAPERCLIP_ID_CONNECTOR_*` values are not aliases for this protocol. Paperclip
+ID used different endpoints, signing metadata, envelope purposes, and Google
+client credentials. An instance with only those legacy values fails with
+`CONNECTOR_MIGRATION_REQUIRED`. Enroll it with Paperclip Cloud and reconnect
+each legacy Google grant. Cloud-hosted fleets must deliver the new enrollment
+keys before they deploy a binary that enables the Cloud connector.
 
 ## Paperclip access defaults
 

@@ -23,6 +23,7 @@ type PendingEnrollment = {
   returnState: string;
   origin: string;
   expiresAt: string;
+  companyId?: string;
 };
 
 export type PaperclipCloudConnectorIdentity = {
@@ -42,7 +43,7 @@ export type PaperclipCloudConnectorIdentity = {
 
 export type PaperclipCloudConnectorEnrollmentStatus = {
   configured: boolean;
-  status: PaperclipCloudConnectorIdentity["status"] | "not_configured";
+  status: PaperclipCloudConnectorIdentity["status"] | "not_configured" | "suspended" | "unverified";
   brokerBaseUrl: string;
   instanceId: string | null;
   environment: LocalConnectorEnvironment;
@@ -72,17 +73,15 @@ export function paperclipCloudConnectorEnrollmentStatus(
   const identity = loadPaperclipCloudConnectorIdentity();
   const brokerBaseUrl = normalizeBrokerOrigin(
     env.PAPERCLIP_CLOUD_CONNECTOR_BASE_URL
-      ?? env.PAPERCLIP_ID_CONNECTOR_BASE_URL
       ?? identity?.brokerBaseUrl
       ?? "https://my.paperclip.app",
   );
   const environment = connectorEnvironment(env, identity?.environment, brokerBaseUrl);
   if (!identity) {
-    const managedInstanceId = env.PAPERCLIP_CLOUD_CONNECTOR_INSTANCE_ID?.trim()
-      ?? env.PAPERCLIP_ID_CONNECTOR_INSTANCE_ID?.trim();
+    const managedInstanceId = env.PAPERCLIP_CLOUD_CONNECTOR_INSTANCE_ID?.trim();
     const managedKeysPresent = Boolean(
-      (env.PAPERCLIP_CLOUD_CONNECTOR_SIGN_PRIVATE_KEY?.trim() ?? env.PAPERCLIP_ID_CONNECTOR_SIGN_PRIVATE_KEY?.trim())
-      && (env.PAPERCLIP_CLOUD_CONNECTOR_SEAL_PRIVATE_KEY?.trim() ?? env.PAPERCLIP_ID_CONNECTOR_SEAL_PRIVATE_KEY?.trim()),
+      env.PAPERCLIP_CLOUD_CONNECTOR_SIGN_PRIVATE_KEY?.trim()
+      && env.PAPERCLIP_CLOUD_CONNECTOR_SEAL_PRIVATE_KEY?.trim(),
     );
     if (managedInstanceId && managedKeysPresent) {
       const publicOrigin = env.PAPERCLIP_PUBLIC_URL ? normalizeInstanceOrigin(env.PAPERCLIP_PUBLIC_URL) : undefined;
@@ -114,6 +113,17 @@ export function paperclipCloudConnectorEnrollmentStatus(
 export async function startPaperclipCloudConnectorEnrollment(input: {
   origin: string;
   label?: string;
+  companyId?: string;
+  env?: NodeJS.ProcessEnv;
+  request?: typeof fetch;
+}): Promise<PaperclipCloudConnectorEnrollmentStatus> {
+  return withEnrollmentMutationLock(() => startPaperclipCloudConnectorEnrollmentUnlocked(input));
+}
+
+async function startPaperclipCloudConnectorEnrollmentUnlocked(input: {
+  origin: string;
+  label?: string;
+  companyId?: string;
   env?: NodeJS.ProcessEnv;
   request?: typeof fetch;
 }): Promise<PaperclipCloudConnectorEnrollmentStatus> {
@@ -121,7 +131,10 @@ export async function startPaperclipCloudConnectorEnrollment(input: {
   const request = input.request ?? fetch;
   const origin = normalizeInstanceOrigin(input.origin);
   let identity = loadPaperclipCloudConnectorIdentity() ?? createIdentity(env);
-  if (identity.status === "active" && identity.origins.includes(origin)) {
+  if (identity.status === "pending" && identity.pending && Date.parse(identity.pending.expiresAt) > Date.now()) {
+    if (identity.pending.origin !== origin) {
+      throw new Error("Paperclip Cloud enrollment is already pending for another origin");
+    }
     return paperclipCloudConnectorEnrollmentStatus(env);
   }
   const returnState = randomBytes(32).toString("base64url");
@@ -153,7 +166,13 @@ export async function startPaperclipCloudConnectorEnrollment(input: {
   identity = {
     ...identity,
     status: "pending",
-    pending: { enrollmentId: body.enrollmentId, returnState, origin, expiresAt: body.expiresAt },
+    pending: {
+      enrollmentId: body.enrollmentId,
+      returnState,
+      origin,
+      expiresAt: body.expiresAt,
+      ...(input.companyId ? { companyId: input.companyId } : {}),
+    },
   };
   saveIdentity(identity);
   return {
@@ -164,6 +183,15 @@ export async function startPaperclipCloudConnectorEnrollment(input: {
 }
 
 export async function completePaperclipCloudConnectorEnrollment(input: {
+  enrollmentId: string;
+  approvalCode: string;
+  state: string;
+  request?: typeof fetch;
+}): Promise<PaperclipCloudConnectorEnrollmentStatus> {
+  return withEnrollmentMutationLock(() => completePaperclipCloudConnectorEnrollmentUnlocked(input));
+}
+
+async function completePaperclipCloudConnectorEnrollmentUnlocked(input: {
   enrollmentId: string;
   approvalCode: string;
   state: string;
@@ -268,7 +296,7 @@ function connectorEnvironment(
     : host === "my-staging.paperclip.app"
       ? "staging"
       : "development";
-  const value = env.PAPERCLIP_CLOUD_CONNECTOR_ENVIRONMENT ?? env.PAPERCLIP_ID_CONNECTOR_ENVIRONMENT ?? fallback ?? inferred;
+  const value = env.PAPERCLIP_CLOUD_CONNECTOR_ENVIRONMENT ?? fallback ?? inferred;
   if (!isEnvironment(value)) throw new Error("Paperclip Cloud connector environment is invalid");
   return value;
 }
@@ -328,4 +356,20 @@ function loopback(hostname: string): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+let enrollmentMutationTail: Promise<void> = Promise.resolve();
+
+async function withEnrollmentMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = enrollmentMutationTail;
+  let release!: () => void;
+  enrollmentMutationTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
 }

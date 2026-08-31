@@ -59,9 +59,10 @@ import {
 } from "../services/paperclip-cloud-connector.js";
 import {
   completePaperclipCloudConnectorEnrollment,
-  paperclipCloudConnectorEnrollmentStatus,
+  loadPaperclipCloudConnectorIdentity,
   startPaperclipCloudConnectorEnrollment,
 } from "../services/paperclip-cloud-connector-enrollment.js";
+import { reconcilePaperclipCloudConnectorEnrollmentStatus } from "../services/paperclip-cloud-connector-status.js";
 import {
   OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
   oauthClientIdMetadataDocument,
@@ -836,23 +837,37 @@ export function toolAccessRoutes(
 
   router.get("/tools/oauth/cloud-connector/enrollment", async (req, res) => {
     assertBoard(req);
-    res.json(paperclipCloudConnectorEnrollmentStatus());
+    res.json(await reconcilePaperclipCloudConnectorEnrollmentStatus());
   });
 
   router.post("/tools/oauth/cloud-connector/enrollment", async (req, res) => {
     assertBoard(req);
+    const companyId = typeof req.body?.companyId === "string" ? req.body.companyId : "";
+    if (!companyId) throw badRequest("Paperclip Cloud enrollment requires a company");
+    assertCompanyAccess(req, companyId);
     const origin = new URL(oauthRedirectUri(req)).origin;
+    let status;
     try {
-      const status = await startPaperclipCloudConnectorEnrollment({
+      status = await startPaperclipCloudConnectorEnrollment({
         origin,
+        companyId,
         label: typeof req.body?.label === "string" ? req.body.label : undefined,
       });
-      res.status(201).json(status);
     } catch {
       throw unprocessable("Paperclip Cloud enrollment could not be started", {
         code: "paperclip_cloud_connector_enrollment_failed",
       });
     }
+    await logActivity(db, {
+      companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "paperclip_cloud_connector.enrollment_started",
+      entityType: "connector_instance",
+      entityId: status.instanceId ?? "pending",
+      details: { environment: status.environment, status: status.status },
+    });
+    res.status(201).json(status);
   });
 
   router.get("/tools/oauth/cloud-connector/enrollment-callback", async (req, res) => {
@@ -861,10 +876,24 @@ export function toolAccessRoutes(
     const approvalCode = typeof req.query.approval_code === "string" ? req.query.approval_code : "";
     const state = typeof req.query.state === "string" ? req.query.state : "";
     if (!enrollmentId || !approvalCode || !state) throw badRequest("Invalid Paperclip Cloud enrollment callback");
+    const pending = loadPaperclipCloudConnectorIdentity()?.pending;
+    if (pending?.companyId) assertCompanyAccess(req, pending.companyId);
+    let status;
     try {
-      await completePaperclipCloudConnectorEnrollment({ enrollmentId, approvalCode, state });
+      status = await completePaperclipCloudConnectorEnrollment({ enrollmentId, approvalCode, state });
     } catch {
       throw badRequest("Invalid or expired Paperclip Cloud enrollment callback");
+    }
+    if (pending?.companyId) {
+      await logActivity(db, {
+        companyId: pending.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "paperclip_cloud_connector.enrollment_completed",
+        entityType: "connector_instance",
+        entityId: status.instanceId ?? enrollmentId,
+        details: { environment: status.environment, status: status.status },
+      });
     }
     res.redirect(303, "/apps/connections?cloud_connector=enrolled");
   });

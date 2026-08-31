@@ -931,7 +931,7 @@ Suggested PR verification block:
 | `transport` | `mcp_remote`, `local_stdio`, or specialized `rest_api`. |
 | `auth` | `oauth`, `api_key`, or `none`. |
 | `ownershipModes` | Allowed OAuth client ownership modes; also present for non-OAuth customer configuration. |
-| `oauthStrategy` | Managed broker strategy. New definitions use `paperclip_cloud_connector`; `paperclip_id_connector` is a read-only compatibility alias for existing records. Only valid for OAuth. |
+| `oauthStrategy` | Managed broker strategy. New definitions use `paperclip_cloud_connector`; `paperclip_id_connector` is recognized only to require migration when an old grant expires. The protocols and provider clients are not interchangeable. Only valid for OAuth. |
 | `connectorProfile` | Managed connector capability/scope profile, required with `oauthStrategy`. |
 | `capabilityProfile` | User-facing read/write/mode grouping used for method selection. |
 | `grantKinds` | Restricts identity to `organization` and/or `user`; omit for flexible methods. |

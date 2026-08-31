@@ -28,7 +28,7 @@ vi.mock("@/api/tools", () => ({
     archiveConnection: (connectionId: string, options?: { confirmComposioChildren?: boolean }) =>
       archiveConnectionMock(connectionId, options),
     getCloudConnectorEnrollment: () => getCloudConnectorEnrollmentMock(),
-    startCloudConnectorEnrollment: (label?: string) => startCloudConnectorEnrollmentMock(label),
+    startCloudConnectorEnrollment: (companyId: string, label?: string) => startCloudConnectorEnrollmentMock(companyId, label),
   },
 }));
 

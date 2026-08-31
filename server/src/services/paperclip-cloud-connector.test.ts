@@ -164,6 +164,40 @@ describe("Paperclip Cloud connector", () => {
     await expect(connector.getCapabilities()).resolves.toEqual(["gmail.read", "drive.write"]);
   });
 
+  it("checks Cloud enrollment status with an instance-only signed request", async () => {
+    const keys = config();
+    const request = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { request: string };
+      const [, encodedClaims] = body.request.split(".");
+      const claims = JSON.parse(Buffer.from(encodedClaims!, "base64url").toString("utf8"));
+      expect(claims).toMatchObject({
+        iss: instanceId,
+        aud: "https://my.example.test/v1/connector/instance-status",
+        sub: "instance-status",
+        cid: "instance-status",
+        env: "staging",
+        op: "status",
+      });
+      expect(claims).not.toHaveProperty("prv");
+      expect(claims).not.toHaveProperty("prf");
+      expect(claims).not.toHaveProperty("scp");
+      return Response.json({ active: true, status: "active" });
+    });
+    const connector = createPaperclipCloudConnector({ config: keys.config, request: request as typeof fetch });
+
+    await expect(connector.getInstanceStatus()).resolves.toBe("active");
+  });
+
+  it("treats an unknown Cloud enrollment as removed without exposing Cloud detail", async () => {
+    const keys = config();
+    const connector = createPaperclipCloudConnector({
+      config: keys.config,
+      request: vi.fn(async () => new Response("unknown instance detail", { status: 401 })) as typeof fetch,
+    });
+
+    await expect(connector.getInstanceStatus()).resolves.toBe("removed");
+  });
+
   it("does not expose a broker response body when a request fails", async () => {
     const keys = config();
     const request = vi.fn(async () => new Response(JSON.stringify({
@@ -190,13 +224,22 @@ describe("Paperclip Cloud connector", () => {
       PAPERCLIP_CLOUD_CONNECTOR_ENVIRONMENT: "development",
       PAPERCLIP_CLOUD_CONNECTOR_BASE_URL: "http://my.example.test",
     })).toThrowError(/HTTPS/);
-    expect(() => paperclipCloudConnectorConfigFromEnv({
-      PAPERCLIP_ID_CONNECTOR_INSTANCE_ID: instanceId,
-      PAPERCLIP_ID_CONNECTOR_SIGN_PRIVATE_KEY: "key",
-      PAPERCLIP_ID_CONNECTOR_SEAL_PRIVATE_KEY: "key",
-      PAPERCLIP_ID_CONNECTOR_ENVIRONMENT: "development",
-      PAPERCLIP_ID_CONNECTOR_BASE_URL: "http://my.example.test",
-    })).toThrowError(/HTTPS/);
+    const legacyError = (() => {
+      try {
+        paperclipCloudConnectorConfigFromEnv({
+          PAPERCLIP_ID_CONNECTOR_INSTANCE_ID: instanceId,
+          PAPERCLIP_ID_CONNECTOR_SIGN_PRIVATE_KEY: "key",
+          PAPERCLIP_ID_CONNECTOR_SEAL_PRIVATE_KEY: "key",
+          PAPERCLIP_ID_CONNECTOR_ENVIRONMENT: "development",
+          PAPERCLIP_ID_CONNECTOR_BASE_URL: "https://id.paperclip.app",
+        });
+        return null;
+      } catch (error) {
+        return error;
+      }
+    })();
+    expect(legacyError).toMatchObject({ code: "CONNECTOR_MIGRATION_REQUIRED" });
+    expect(String(legacyError)).toContain("incompatible legacy protocol");
   });
 });
 

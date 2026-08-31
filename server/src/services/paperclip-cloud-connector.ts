@@ -24,7 +24,7 @@ export const GMAIL_CONNECTOR_SCOPES = [
 export { GOOGLE_WORKSPACE_CONNECTOR_PROFILES };
 
 export type PaperclipCloudConnectorEnvironment = "development" | "staging" | "production";
-export type PaperclipCloudConnectorOperation = "session" | "claim" | "refresh" | "revoke";
+export type PaperclipCloudConnectorOperation = "status" | "session" | "claim" | "refresh" | "revoke";
 
 export type PaperclipCloudConnectorConfig = {
   baseUrl: string;
@@ -71,9 +71,12 @@ type ConnectorResponse = {
   profiles?: unknown;
   protocolVersion?: unknown;
   providers?: unknown;
+  active?: unknown;
+  status?: unknown;
 };
 
 const ENDPOINTS: Record<PaperclipCloudConnectorOperation, string> = {
+  status: "/v1/connector/instance-status",
   session: "/v1/connector/sessions",
   claim: "/v1/connector/claims",
   refresh: "/v1/connector/refresh",
@@ -103,21 +106,37 @@ export function paperclipCloudConnectorConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): PaperclipCloudConnectorConfig | null {
   const localIdentity = loadPaperclipCloudConnectorIdentity();
+  const hasActiveLocalIdentity = localIdentity?.status === "active";
+  const legacyConfigured = [
+    env.PAPERCLIP_ID_CONNECTOR_INSTANCE_ID,
+    env.PAPERCLIP_ID_CONNECTOR_SIGN_PRIVATE_KEY,
+    env.PAPERCLIP_ID_CONNECTOR_SEAL_PRIVATE_KEY,
+    env.PAPERCLIP_ID_CONNECTOR_ENVIRONMENT,
+    env.PAPERCLIP_ID_CONNECTOR_BASE_URL,
+  ].some((value) => Boolean(value?.trim()));
+  const cloudConfigured = [
+    env.PAPERCLIP_CLOUD_CONNECTOR_INSTANCE_ID,
+    env.PAPERCLIP_CLOUD_CONNECTOR_SIGN_PRIVATE_KEY,
+    env.PAPERCLIP_CLOUD_CONNECTOR_SEAL_PRIVATE_KEY,
+    env.PAPERCLIP_CLOUD_CONNECTOR_ENVIRONMENT,
+    env.PAPERCLIP_CLOUD_CONNECTOR_BASE_URL,
+  ].some((value) => Boolean(value?.trim()));
+  if (!cloudConfigured && !hasActiveLocalIdentity && legacyConfigured) {
+    throw new PaperclipCloudConnectorError(
+      "Paperclip ID connector settings use an incompatible legacy protocol; enroll this instance with Paperclip Cloud",
+      "CONNECTOR_MIGRATION_REQUIRED",
+    );
+  }
   const instanceId = env.PAPERCLIP_CLOUD_CONNECTOR_INSTANCE_ID?.trim()
-    || env.PAPERCLIP_ID_CONNECTOR_INSTANCE_ID?.trim()
-    || (localIdentity?.status === "active" ? localIdentity.instanceId : undefined);
+    || (hasActiveLocalIdentity ? localIdentity.instanceId : undefined);
   const signPrivateKey = env.PAPERCLIP_CLOUD_CONNECTOR_SIGN_PRIVATE_KEY?.trim()
-    || env.PAPERCLIP_ID_CONNECTOR_SIGN_PRIVATE_KEY?.trim()
-    || (localIdentity?.status === "active" ? localIdentity.signPrivateKey : undefined);
+    || (hasActiveLocalIdentity ? localIdentity.signPrivateKey : undefined);
   const sealPrivateKey = env.PAPERCLIP_CLOUD_CONNECTOR_SEAL_PRIVATE_KEY?.trim()
-    || env.PAPERCLIP_ID_CONNECTOR_SEAL_PRIVATE_KEY?.trim()
-    || (localIdentity?.status === "active" ? localIdentity.sealPrivateKey : undefined);
+    || (hasActiveLocalIdentity ? localIdentity.sealPrivateKey : undefined);
   const environment = env.PAPERCLIP_CLOUD_CONNECTOR_ENVIRONMENT?.trim()
-    || env.PAPERCLIP_ID_CONNECTOR_ENVIRONMENT?.trim()
-    || (localIdentity?.status === "active" ? localIdentity.environment : undefined);
+    || (hasActiveLocalIdentity ? localIdentity.environment : undefined);
   const baseUrl = env.PAPERCLIP_CLOUD_CONNECTOR_BASE_URL?.trim()
-    || env.PAPERCLIP_ID_CONNECTOR_BASE_URL?.trim()
-    || (localIdentity?.status === "active" ? localIdentity.brokerBaseUrl : undefined)
+    || (hasActiveLocalIdentity ? localIdentity.brokerBaseUrl : undefined)
     || "https://my.paperclip.app";
   const values = [instanceId, signPrivateKey, sealPrivateKey, environment];
   if (values.every((value) => !value)) return null;
@@ -249,6 +268,22 @@ export function createPaperclipCloudConnector(input: {
   }
 
   return {
+    async getInstanceStatus(): Promise<"active" | "suspended" | "removed"> {
+      let response: ConnectorResponse;
+      try {
+        response = await call("status", {
+          subject: "instance-status",
+          companyId: "instance-status",
+        });
+      } catch (error) {
+        if (error instanceof PaperclipCloudConnectorError && error.status === 401) return "removed";
+        throw error;
+      }
+      if (response.status === "active" && response.active === true) return "active";
+      if (response.status === "suspended" && response.active === false) return "suspended";
+      if (response.status === "removed" && response.active === false) return "removed";
+      throw new PaperclipCloudConnectorError("Paperclip Cloud connector returned an invalid instance status", "CONNECTOR_BAD_RESPONSE");
+    },
     async getCapabilities(): Promise<GoogleWorkspaceConnectorProfileId[]> {
       const endpoint = new URL("/v1/connector/capabilities", `${config.baseUrl}/`).toString();
       let response: Response;
@@ -313,11 +348,24 @@ let capabilityCache: { key: string; expiresAt: number; profiles: GoogleWorkspace
 export async function paperclipCloudConnectorCapabilitiesFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<GoogleWorkspaceConnectorProfileId[]> {
-  const config = paperclipCloudConnectorConfigFromEnv(env);
+  let config: PaperclipCloudConnectorConfig | null;
+  try {
+    config = paperclipCloudConnectorConfigFromEnv(env);
+  } catch (error) {
+    if (error instanceof PaperclipCloudConnectorError && error.code === "CONNECTOR_MIGRATION_REQUIRED") return [];
+    throw error;
+  }
   if (!config) return [];
   const key = `${config.baseUrl}|${config.instanceId}|${config.environment}`;
   if (capabilityCache?.key === key && capabilityCache.expiresAt > Date.now()) return capabilityCache.profiles;
-  const profiles = await createPaperclipCloudConnector({ config }).getCapabilities();
+  const connector = createPaperclipCloudConnector({ config });
+  let status: "active" | "suspended" | "removed";
+  try {
+    status = await connector.getInstanceStatus();
+  } catch {
+    return [];
+  }
+  const profiles = status === "active" ? await connector.getCapabilities() : [];
   capabilityCache = { key, expiresAt: Date.now() + 60_000, profiles };
   return profiles;
 }

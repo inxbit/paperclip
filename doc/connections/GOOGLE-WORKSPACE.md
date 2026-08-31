@@ -118,8 +118,9 @@ path.
 Cloud-hosted stacks receive these values through the existing per-stack secret
 delivery path. A self-hosted instance creates its keys during enrollment and
 stores them with owner-only permissions in the instance's ignored secret
-directory. The former `PAPERCLIP_ID_CONNECTOR_*` variables remain temporary
-read aliases; do not use them in new deployments.
+directory. The former `PAPERCLIP_ID_CONNECTOR_*` values use an incompatible
+Paperclip ID protocol and are not read aliases. Enroll with Paperclip Cloud and
+reconnect legacy grants before their old access tokens expire.
 
 The gallery requests the broker capability document with a short cache. A
 Paperclip-managed method is omitted unless its exact profile is enabled at the

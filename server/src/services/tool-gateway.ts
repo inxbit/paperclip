@@ -2652,6 +2652,19 @@ export function createToolGatewayService(
       : Number.NaN;
     const currentTime = options.now?.() ?? Date.now();
     if (Number.isFinite(expiresAt) && expiresAt > currentTime + 60_000) return grant;
+    if (oauth.strategy === "paperclip_id_connector") {
+      // Paperclip ID used different endpoints, signing metadata, envelope
+      // purposes, and a different Google client. Its refresh token cannot be
+      // exchanged through Paperclip Cloud. Let an unexpired access token finish
+      // its useful life, then require an explicit managed-connector enrollment
+      // and provider reconnect instead of sending it to the wrong client.
+      await db.update(connectionGrants).set({ status: "needs_reauthorization", updatedAt: new Date(currentTime) })
+        .where(eq(connectionGrants.id, grant.id));
+      throw new ToolGatewayHttpError(409, "Legacy Google authorization must be reconnected through Paperclip Cloud", "google_reauthorization_required", {
+        connectionId: connection.id,
+        grantId: grant.id,
+      });
+    }
     const existingFlight = gmailRefreshFlights.get(grant.id);
     if (existingFlight) return existingFlight;
     const refresh = (async () => {

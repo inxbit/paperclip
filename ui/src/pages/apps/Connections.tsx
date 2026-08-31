@@ -164,7 +164,7 @@ export function Connections() {
     queryFn: () => toolsApi.getCloudConnectorEnrollment(),
   });
   const startConnectorEnrollment = useMutation({
-    mutationFn: () => toolsApi.startCloudConnectorEnrollment(selectedCompany?.name),
+    mutationFn: () => toolsApi.startCloudConnectorEnrollment(selectedCompanyId!, selectedCompany?.name),
     onSuccess: (status) => {
       if (status.verificationUrl) window.location.assign(status.verificationUrl);
     },
